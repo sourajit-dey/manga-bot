@@ -1,5 +1,12 @@
 import os
 import asyncio
+
+# Fix for Pyrogram on Python 3.10+
+try:
+    asyncio.get_event_loop()
+except RuntimeError:
+    asyncio.set_event_loop(asyncio.new_event_loop())
+
 import logging
 import pyrogram.utils
 from dotenv import load_dotenv
