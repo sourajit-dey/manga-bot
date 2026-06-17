@@ -263,30 +263,32 @@ async def suggestion_reply_handler(client: Client, message: Message):
         
         search_msg = await message.reply_text("Checking online databases for your suggestion...")
         try:
-            results = await mangadex._request("GET", "/manga", params={"title": query, "limit": 1})
+            results = await mangadex._request("GET", "/manga", params={"title": query, "limit": 5})
             if results and results.get("data"):
-                m_data = results["data"][0]
+                best_manga = None
+                best_overall_score = 0
                 
-                all_titles = []
-                if m_data["attributes"].get("title"):
-                    for t in m_data["attributes"]["title"].values():
-                        all_titles.append(t)
-                if m_data["attributes"].get("altTitles"):
-                    for alt in m_data["attributes"]["altTitles"]:
-                        for t in alt.values():
+                for m_data in results["data"]:
+                    all_titles = []
+                    if m_data["attributes"].get("title"):
+                        for t in m_data["attributes"]["title"].values():
                             all_titles.append(t)
-                
-                best_score = 0
-                for t in all_titles:
-                    score = fuzz.WRatio(query.lower(), str(t).lower())
-                    if score > best_score:
-                        best_score = score
-                        
-                if best_score < 60:
+                    if m_data["attributes"].get("altTitles"):
+                        for alt in m_data["attributes"]["altTitles"]:
+                            for t in alt.values():
+                                all_titles.append(t)
+                    
+                    for t in all_titles:
+                        score = fuzz.WRatio(query.lower(), str(t).lower())
+                        if score > best_overall_score:
+                            best_overall_score = score
+                            best_manga = m_data
+                            
+                if best_overall_score < 70 or not best_manga:
                     await search_msg.edit_text(f"Could not find a highly relevant manga for '{query}'. Please check the exact spelling.")
                     return
                 
-                manga_doc, is_new = await process_manga_metadata(m_data)
+                manga_doc, is_new = await process_manga_metadata(best_manga)
                 
                 # Mark as priority
                 await db.manga.update_one({"_id": manga_doc["_id"]}, {"$set": {"priority": 1}})
