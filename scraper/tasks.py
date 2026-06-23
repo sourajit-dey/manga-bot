@@ -85,7 +85,7 @@ async def process_chapter(client, storage_channel_id, manga_doc, chapter_data):
     
     existing = await db.chapters.find_one({"manga_id": manga_doc["manga_id"], "chapter_number": chapter_number})
     if existing:
-        return False
+        return True
         
     logger.info(f"Processing chapter {chapter_number} of {manga_doc['title']}")
     
@@ -235,15 +235,10 @@ async def scraper_loop(client):
                 chapters_list = chapters_resp.get("data", [])
                 
                 if chapters_list:
-                    success_count = 0
                     for c_data in chapters_list:
-                        success = await process_chapter(client, storage_channel_id, manga_doc, c_data)
-                        if success:
-                            success_count += 1
+                        await process_chapter(client, storage_channel_id, manga_doc, c_data)
                         await asyncio.sleep(1)
-                    
-                    if success_count > 0:
-                        await db.manga.update_one({"_id": manga_doc["_id"]}, {"$inc": {"chapter_offset": success_count}})
+                    await db.manga.update_one({"_id": manga_doc["_id"]}, {"$inc": {"chapter_offset": len(chapters_list)}})
                 else:
                     logger.info(f"Exhausted chapters for {manga_doc['title']}. Removing from priority queue.")
                     await db.manga.update_one({"_id": manga_doc["_id"]}, {"$unset": {"priority": ""}})
