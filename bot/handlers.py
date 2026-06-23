@@ -44,11 +44,11 @@ async def get_landscape_anime_image():
 async def get_welcome_data():
     config = await db.state.find_one({"_id": "welcome_config"})
     text = (
-        "✨ **Welcome to the Manga Delivery Bot!** ✨\n\n"
-        "🔍 **Search:** Type any manga name to find it!\n"
-        "📚 **Browse:** Use the menu below to explore our collection.\n"
-        "⚡️ Instant downloads, no waiting!\n\n"
-        "🌟 **Owner:** @Soura123A"
+        "✨ **Welcome to Manga Delivery!** ✨\n\n"
+        "Your personal, ad-free manga reading assistant.\n\n"
+        "📥 **Request any Manga:** Just tap 'Suggest Manga' and I'll fetch it.\n"
+        "📖 **Read Instantly:** High-quality PDF chapters sent directly to your chat.\n"
+        "⚡️ **Smart Queue:** You control what I download."
     )
     image = None
     
@@ -98,6 +98,15 @@ async def check_subscription(client: Client, message_or_query):
 async def start_command(client: Client, message: Message):
     if not await check_subscription(client, message): return
     
+    if len(message.command) > 1:
+        payload = message.command[1]
+        if payload.startswith("manga_"):
+            manga_id = payload.split("manga_")[1]
+            manga = await db.manga.find_one({"manga_id": manga_id})
+            if manga:
+                await send_manga_details(client, message.chat.id, manga)
+                return
+    
     welcome_text, image = await get_welcome_data()
     
     if image:
@@ -125,6 +134,23 @@ async def random_command(client: Client, message: Message):
         
     m = random_manga[0]
     await send_manga_details(client, message.chat.id, m)
+
+@Client.on_message(filters.command("queue") & filters.private)
+async def queue_command(client: Client, message: Message):
+    if not await check_subscription(client, message): return
+    
+    cursor = db.manga.find({"priority": 1}).sort("added_date", 1)
+    mangas = await cursor.to_list(length=None)
+    
+    if not mangas:
+        await message.reply_text("✅ The priority queue is currently empty! The background scraper is fully caught up.")
+        return
+        
+    text = "🚀 **Current Priority Queue**\n\nThe background scraper will download chapters for these mangas first in the following order:\n\n"
+    for idx, m in enumerate(mangas, start=1):
+        text += f"{idx}. **{m['title']}**\n"
+        
+    await message.reply_text(text)
 
 @Client.on_message(filters.command("latest") & filters.private)
 async def latest_command(client: Client, message: Message):
@@ -211,16 +237,24 @@ async def test_news_command(client: Client, message: Message):
 
 # --- Text Handler for Search ---
 
-@Client.on_message(filters.text & filters.private & ~filters.command(["start", "random", "latest", "stats"]))
+@Client.on_message(filters.text & filters.private & ~filters.reply & ~filters.command(["start", "random", "latest", "stats", "queue"]))
 async def text_search_handler(client: Client, message: Message):
     if not await check_subscription(client, message): return
     query = message.text
     
-    # Get all manga titles from DB for fuzzy matching
-    # Note: For large DBs, it's better to use MongoDB Text Search
-    # db.manga.find({"$text": {"$search": query}})
-    # But user specifically requested rapidfuzz
+    # Check if waiting for specific chapter
+    user_state = await db.state.find_one({"user_id": message.chat.id})
+    if user_state and user_state.get("action") == "awaiting_chapter":
+        manga_id = user_state["manga_id"]
+        chapter_num = query.strip()
+        
+        await db.state.delete_one({"user_id": message.chat.id})
+        await db.priority_chapters.insert_one({"manga_id": manga_id, "chapter_number": chapter_num})
+        
+        await message.reply_text(f"✅ Added Chapter **{chapter_num}** to the priority override! The scraper will fetch it immediately on its next cycle (within 1 minute).")
+        return
     
+    # Get all manga titles from DB for fuzzy matching
     cursor = db.manga.find({}, {"title": 1, "manga_id": 1, "alt_titles": 1})
     mangas = await cursor.to_list(length=None)
     
@@ -243,9 +277,11 @@ async def text_search_handler(client: Client, message: Message):
                         
     if not matched_mangas:
         keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📚 Browse Available Manga", callback_data="latest")],
+            [InlineKeyboardButton("🏷️ Browse by Genre", callback_data="genres")],
             [InlineKeyboardButton("💡 Suggest Manga", callback_data="suggest_manga")]
         ])
-        await message.reply_text("No manga found matching your query. Please check your spelling.\n\nIf you are sure it exists, use the Suggest button below to add it to our priority queue!", reply_markup=keyboard)
+        await message.reply_text("No manga found matching your query. It may not be available yet.\n\nUse the buttons below to explore our collection or suggest a new manga!", reply_markup=keyboard)
         return
         
     keyboard = get_manga_list_keyboard(matched_mangas)
@@ -260,10 +296,17 @@ async def suggestion_reply_handler(client: Client, message: Message):
         
         from scraper.mangadex import mangadex
         from scraper.tasks import process_manga_metadata, notify_news_channel
+        from scraper.anilist import search_anilist
         
         search_msg = await message.reply_text("Checking online databases for your suggestion...")
         try:
-            results = await mangadex._request("GET", "/manga", params={"title": query, "limit": 10, "order[relevance]": "desc"})
+            # Step 1: Translate English query to exact Romaji via Anilist
+            romaji_query = await search_anilist(query)
+            if romaji_query != query:
+                await search_msg.edit_text(f"Translated '{query}' to '{romaji_query}'. Searching MangaDex...")
+                
+            # Step 2: Search MangaDex with the precise Romaji title
+            results = await mangadex._request("GET", "/manga", params={"title": romaji_query, "limit": 10, "order[relevance]": "desc"})
             if results and results.get("data"):
                 best_manga = None
                 best_overall_score = 0
@@ -279,13 +322,15 @@ async def suggestion_reply_handler(client: Client, message: Message):
                                 all_titles.append(t)
                     
                     for t in all_titles:
-                        score = fuzz.WRatio(query.lower(), str(t).lower())
+                        score_orig = fuzz.WRatio(query.lower(), str(t).lower())
+                        score_romaji = fuzz.WRatio(romaji_query.lower(), str(t).lower())
+                        score = max(score_orig, score_romaji)
                         if score > best_overall_score:
                             best_overall_score = score
                             best_manga = m_data
                             
                 if best_overall_score < 85 or not best_manga:
-                    await search_msg.edit_text(f"Could not find an exact match for '{query}'. Please try using the Japanese Romaji name, or check your spelling.")
+                    await search_msg.edit_text(f"Could not find an exact match for '{query}'.")
                     return
                 
                 manga_doc, is_new = await process_manga_metadata(best_manga)
@@ -296,7 +341,11 @@ async def suggestion_reply_handler(client: Client, message: Message):
                 if is_new:
                     await notify_news_channel(client, manga_doc)
                 
-                await search_msg.edit_text(f"✅ Found **{manga_doc['title']}** online!\n\nI have added it to the priority download queue. The first chapters will be available shortly!")
+                queue_count = await db.manga.count_documents({"priority": 1})
+                await search_msg.edit_text(f"✅ Found **{manga_doc['title']}** online!\n\nI have added it to the Priority Queue (You are currently #{queue_count} in line). The first chapters will be available shortly!")
+                
+                # Automatically show the queue list
+                await queue_command(client, message)
                 return
         except Exception as e:
             logger.error(f"Error searching mangadex: {e}")
@@ -335,13 +384,12 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         
     elif data == "help":
         help_text = (
-            "❓ **How to use the Manga Delivery Bot** ❓\n\n"
-            "📖 **Search:** Simply type the name of any manga (e.g., 'Solo Leveling') to search for it directly.\n"
-            "📚 **Browse:** Use the buttons below to explore our genres or see what's newly added.\n"
-            "📥 **Download:** Click on a manga to view its chapters. Click a chapter to receive the file instantly!\n\n"
-            "Enjoy reading! 🌟"
+            "❓ **How to use Manga Delivery** ❓\n\n"
+            "📥 **Suggest Manga:** Click 'Suggest New Manga' and type any manga name. I will find the official English version and add it to my queue!\n"
+            "⚡️ **Smart Queue:** I automatically download chapters in the background. You can read downloaded chapters instantly, even while the rest are fetching.\n"
+            "🎯 **Priority Fetching:** If you are waiting in queue, use the 'Fetch Specific Chapter' button to jump the line and download the exact chapter you want right now!\n\n"
+            "Enjoy your ad-free reading! 🌟"
         )
-        # Assuming the message is a photo (since the menu has a photo)
         try:
             await callback_query.message.edit_caption(
                 caption=help_text,
@@ -375,7 +423,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
             return
         await callback_query.message.edit_text(
             "📚 **Browse by Genre:**",
-            reply_markup=get_genres_keyboard(genres[:50]) # Limit to avoid exceeding payload size
+            reply_markup=get_genres_keyboard(genres[:50])
         )
         
     elif data.startswith("genre:"):
@@ -400,7 +448,6 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         manga_id = data.split(":")[1]
         manga = await db.manga.find_one({"manga_id": manga_id})
         if manga:
-            # Click-to-prioritize
             await db.manga.update_one({"manga_id": manga_id}, {"$set": {"priority": 1}})
             await callback_query.answer("Moved to Priority Queue! The background scraper will fetch this next.", show_alert=True)
             await send_manga_details(client, callback_query.message.chat.id, manga)
@@ -419,38 +466,56 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         else:
             await callback_query.answer("Chapter file not found.", show_alert=True)
 
+    elif data.startswith("fetch_chap_"):
+        manga_id = data.split("fetch_chap_")[1]
+        await db.state.update_one({"user_id": callback_query.message.chat.id}, {"$set": {"action": "awaiting_chapter", "manga_id": manga_id}}, upsert=True)
+        await callback_query.message.reply_text("Please type the exact chapter number you want to fetch immediately (e.g., `10` or `12.5`):")
+        await callback_query.answer()
+
 
 # --- Helper Functions for sending ---
 
-async def send_manga_details(client: Client, chat_id: int, manga: dict):
-    manga_id = manga["manga_id"]
-    title = manga["title"]
-    description = manga.get("description", "No description available.")[:500]
-    if len(manga.get("description", "")) > 500:
+async def send_manga_details(client: Client, chat_id: int, manga_doc: dict):
+    manga_id = manga_doc["manga_id"]
+    title = manga_doc["title"]
+    description = manga_doc.get("description", "No description available.")[:500]
+    if len(manga_doc.get("description", "")) > 500:
         description += "..."
-    genres = ", ".join(manga.get("genres", []))
+    genres = ", ".join(manga_doc.get("genres", []))
     
     text = f"📖 **{title}**\n\n"
     if genres:
         text += f"**Genres:** {genres}\n\n"
     text += f"**Description:**\n{description}"
     
-    # Get chapters
-    cursor = db.chapters.find({"manga_id": manga_id}).sort("chapter_number", 1)
-    chapters = await cursor.to_list(length=None)
+    # Allow reading while fetching
+    chapters_cursor = db.chapters.find({"manga_id": manga_id}).sort("chapter_number", 1)
+    chapters = await chapters_cursor.to_list(length=None)
     
     if not chapters:
-        text += "\n\n⏳ **Chapters are currently being downloaded! Please check back in a few minutes.**"
+        if manga_doc.get("priority") == 1:
+            await client.send_message(chat_id, f"**{title}** is currently in the download queue and has 0 chapters downloaded so far.\n\nPlease check back in a few minutes!")
+        else:
+            await client.send_message(chat_id, f"No chapters available for **{title}** yet.")
+        return
     
+    queue_msg = ""
+    if manga_doc.get("priority") == 1:
+        queue_msg = "\n\n*(⏳ This manga is currently in the priority queue. More chapters are downloading in the background!)*"
+    
+    text += queue_msg
     keyboard = get_chapters_keyboard(manga_id, chapters)
     
-    if manga.get("cover_url"):
+    if manga_doc.get("priority") == 1:
+        keyboard.inline_keyboard.insert(0, [InlineKeyboardButton("🎯 Fetch Chapter", callback_data=f"fetch_chap_{manga_id}")])
+        
+    if manga_doc.get("cover_url"):
         try:
-            if "mangadex.org" in manga["cover_url"]:
+            if "mangadex.org" in manga_doc["cover_url"]:
                 import io
                 import aiohttp
                 async with aiohttp.ClientSession(headers={"User-Agent": "Mozilla/5.0"}) as session:
-                    async with session.get(manga["cover_url"]) as resp:
+                    async with session.get(manga_doc["cover_url"]) as resp:
                         if resp.status == 200:
                             img_bytes = await resp.read()
                             bio = io.BytesIO(img_bytes)
@@ -458,10 +523,10 @@ async def send_manga_details(client: Client, chat_id: int, manga: dict):
                             await client.send_photo(chat_id, photo=bio, caption=text, reply_markup=keyboard)
                             return
             else:
-                await client.send_photo(chat_id, photo=manga["cover_url"], caption=text, reply_markup=keyboard)
+                await client.send_photo(chat_id, photo=manga_doc["cover_url"], caption=text, reply_markup=keyboard)
                 return
         except Exception as e:
-            logger.warning(f"Could not send photo {manga['cover_url']}: {e}")
+            logger.warning(f"Could not send photo {manga_doc.get('cover_url')}: {e}")
             
     await client.send_message(chat_id, text=text, reply_markup=keyboard)
 

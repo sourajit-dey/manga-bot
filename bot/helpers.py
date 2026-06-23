@@ -3,26 +3,26 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 def get_main_menu_keyboard():
     return InlineKeyboardMarkup([
         [
-            InlineKeyboardButton("🔍 Search Manga", switch_inline_query_current_chat=""),
-            InlineKeyboardButton("📚 Browse Genres", callback_data="genres")
+            InlineKeyboardButton("💡 Suggest Manga", callback_data="suggest_manga")
+        ],
+        [
+            InlineKeyboardButton("📚 Library", callback_data="latest"),
+            InlineKeyboardButton("🔍 Genres", callback_data="genres")
         ],
         [
             InlineKeyboardButton("🎲 Random", callback_data="random"),
-            InlineKeyboardButton("🆕 Latest Additions", callback_data="latest")
-        ],
-        [
-            InlineKeyboardButton("💡 Suggest Manga", callback_data="suggest_manga"),
-            InlineKeyboardButton("❓ Help & Info", callback_data="help")
+            InlineKeyboardButton("❓ Help", callback_data="help")
         ]
     ])
 
 def get_manga_list_keyboard(manga_list, prefix="manga"):
     buttons = []
     for m in manga_list:
-        buttons.append([InlineKeyboardButton(m["title"], callback_data=f"{prefix}:{m['manga_id']}")])
+        title = m['title']
+        buttons.append([InlineKeyboardButton(title, callback_data=f"{prefix}:{m['manga_id']}")])
     
     # Back button to main menu
-    buttons.append([InlineKeyboardButton("🔙 Back to Menu", callback_data="main_menu")])
+    buttons.append([InlineKeyboardButton("🔙 Menu", callback_data="main_menu")])
     return InlineKeyboardMarkup(buttons)
 
 def get_genres_keyboard(genres):

@@ -165,9 +165,18 @@ async def notify_news_channel(client, manga_doc):
     if not news_channel_id:
         return
     try:
+        from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+        me = await client.get_me()
+        bot_username = me.username
+        
         news_channel_id = int(news_channel_id)
         desc = manga_doc['description'][:150] + "..." if len(manga_doc['description']) > 150 else manga_doc['description']
-        text = f"🆕 **New Manga Added!**\n\n📖 **{manga_doc['title']}**\n\n{desc}\n\n👉 Search for it in the bot to start reading!"
+        text = f"🆕 **New Manga Added!**\n\n📖 **{manga_doc['title']}**\n\n{desc}"
+        
+        keyboard = InlineKeyboardMarkup([
+            [InlineKeyboardButton("📖 Read Now", url=f"https://t.me/{bot_username}?start=manga_{manga_doc['manga_id']}")]
+        ])
+        
         if manga_doc.get("cover_url"):
             async with aiohttp.ClientSession() as session:
                 async with session.get(manga_doc["cover_url"]) as resp:
@@ -175,93 +184,68 @@ async def notify_news_channel(client, manga_doc):
                         img_bytes = await resp.read()
                         bio = io.BytesIO(img_bytes)
                         bio.name = "cover.jpg"
-                        await client.send_photo(news_channel_id, photo=bio, caption=text)
+                        await client.send_photo(news_channel_id, photo=bio, caption=text, reply_markup=keyboard)
                     else:
-                        await client.send_message(news_channel_id, text)
+                        await client.send_message(news_channel_id, text, reply_markup=keyboard)
         else:
-            await client.send_message(news_channel_id, text)
+            await client.send_message(news_channel_id, text, reply_markup=keyboard)
     except Exception as e:
         logger.error(f"Failed to notify news channel: {e}")
 
 async def scraper_loop(client):
     interval = int(os.environ.get("CHECK_INTERVAL", 300))
     storage_channel_id = int(os.environ.get("STORAGE_CHANNEL_ID"))
-
     await asyncio.sleep(5)
 
     while True:
         try:
-            # 1. Discover 1 new manga
-            offset_doc = await db.state.find_one({"_id": "discovery_offset"})
-            d_offset = offset_doc["offset"] if offset_doc else 0
+            # 0. Check for Priority Chapters (Exact chapter fetching)
+            priority_chapter = await db.priority_chapters.find_one_and_delete({})
+            if priority_chapter:
+                manga_id = priority_chapter["manga_id"]
+                chapter_number = priority_chapter["chapter_number"]
+                manga_doc = await db.manga.find_one({"manga_id": manga_id})
+                if manga_doc:
+                    logger.info(f"Fetching specific priority chapter {chapter_number} for {manga_doc['title']}")
+                    chapters_resp = await mangadex.fetch_manga_chapters(manga_id, limit=500)
+                    if chapters_resp and chapters_resp.get("data"):
+                        for c_data in chapters_resp["data"]:
+                            if str(c_data["attributes"].get("chapter")) == str(chapter_number):
+                                await process_chapter(client, storage_channel_id, manga_doc, c_data)
+                                break
+                                
+            # 1. Progress priority queue sequentially (2 chapters at a time)
+            cursor = db.manga.find({"priority": 1}).sort("added_date", 1)
+            mangas = await cursor.to_list(length=None)
             
-            logger.info(f"Scraper cycle: Discovery at offset {d_offset}")
-            response = await mangadex.fetch_popular_manga(limit=1, offset=d_offset)
-            manga_list = response.get("data", [])
-            
-            if manga_list:
-                m_data = manga_list[0]
-                manga_doc, is_new = await process_manga_metadata(m_data)
-                if is_new:
-                    # Notify channel when a new manga is added
-                    await notify_news_channel(client, manga_doc)
-                await db.state.update_one({"_id": "discovery_offset"}, {"$set": {"offset": d_offset + 1}}, upsert=True)
-                
-            # 2. Progress existing library (Distributed Round-Robin + Priority)
-            p_offset_doc = await db.state.find_one({"_id": "process_offset"})
-            p_offset = p_offset_doc["offset"] if p_offset_doc else 0
-            
-            logger.info(f"Scraper cycle: Processing 5 mangas starting at offset {p_offset}")
-            
-            # Find up to 5 priority mangas first
-            priority_cursor = db.manga.find({"priority": 1}).sort("added_date", 1).limit(5)
-            mangas = await priority_cursor.to_list(length=5)
-            
-            needed = 5 - len(mangas)
-            regular_mangas = []
-            
-            if needed > 0:
-                # Fill the rest with regular round-robin
-                cursor = db.manga.find({"priority": {"$ne": 1}}).sort("added_date", 1).skip(p_offset).limit(needed)
-                regular_mangas = await cursor.to_list(length=needed)
-                mangas.extend(regular_mangas)
-                
             if not mangas:
-                logger.info("Reached end of DB or no mangas. Resetting process_offset to 0.")
-                await db.state.update_one({"_id": "process_offset"}, {"$set": {"offset": 0}}, upsert=True)
+                logger.info("No mangas in priority queue. Sleeping.")
+                await asyncio.sleep(interval)
                 continue
                 
             for manga_doc in mangas:
                 c_offset = manga_doc.get("chapter_offset", 0)
+                logger.info(f"Scraper: Fetching 2 chapters for {manga_doc['title']} at offset {c_offset}")
                 
-                # Fetch exactly 5 chapters ascending
-                chapters_resp = await mangadex.fetch_manga_chapters(manga_doc["manga_id"], limit=5, offset=c_offset)
-                if not chapters_resp:
-                    continue
+                chapters_resp = await mangadex.fetch_manga_chapters(manga_doc["manga_id"], limit=2, offset=c_offset)
+                if not chapters_resp: continue
                 chapters_list = chapters_resp.get("data", [])
                 
                 if chapters_list:
                     for c_data in chapters_list:
                         await process_chapter(client, storage_channel_id, manga_doc, c_data)
-                        await asyncio.sleep(1) # Prevent flood waits
-                    
-                    # Advance chapter_offset by the number of chapters fetched
+                        await asyncio.sleep(1)
                     await db.manga.update_one({"_id": manga_doc["_id"]}, {"$inc": {"chapter_offset": len(chapters_list)}})
                 else:
-                    # Exhausted all chapters for this manga!
-                    # If it has a priority tag, remove it because it's caught up
-                    if manga_doc.get("priority"):
-                        await db.manga.update_one({"_id": manga_doc["_id"]}, {"$unset": {"priority": ""}})
+                    logger.info(f"Exhausted chapters for {manga_doc['title']}. Removing from priority queue.")
+                    await db.manga.update_one({"_id": manga_doc["_id"]}, {"$unset": {"priority": ""}})
                     
-            # Move process_offset forward only by the number of regular mangas processed
-            if regular_mangas:
-                await db.state.update_one({"_id": "process_offset"}, {"$set": {"offset": p_offset + len(regular_mangas)}}, upsert=True)
-            elif needed > 0:
-                # If we needed regular mangas but didn't find any, we hit the end of the DB
-                await db.state.update_one({"_id": "process_offset"}, {"$set": {"offset": 0}}, upsert=True)
-            
-            logger.info(f"Scraper cycle finished. Sleeping for {interval} seconds")
-            await asyncio.sleep(interval)
+            if mangas:
+                logger.info("Scraper cycle finished. Sleeping for 10 seconds before next rotation.")
+                await asyncio.sleep(10)
+            else:
+                logger.info(f"No priority mangas. Sleeping for {interval} seconds.")
+                await asyncio.sleep(interval)
             
         except Exception as e:
             logger.error(f"Error in scraper loop: {e}")

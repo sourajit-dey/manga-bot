@@ -72,3 +72,22 @@ async def fetch_anilist_cover(manga_title: str) -> str:
     except Exception as e:
         logger.error(f"Failed to fetch AniList cover for {manga_title}: {e}")
         return None
+
+async def search_anilist(query_str: str) -> str:
+    """
+    Searches AniList for an English name and returns the Romaji name that MangaDex requires.
+    """
+    variables = {"search": query_str}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post(ANILIST_URL, json={"query": query, "variables": variables}) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    media = data.get("data", {}).get("Media")
+                    if media:
+                        titles = media.get("title", {})
+                        # Return Romaji, fallback to English if Romaji is somehow missing
+                        return titles.get("romaji") or titles.get("english") or query_str
+    except Exception as e:
+        logger.error(f"Failed to search AniList for {query_str}: {e}")
+    return query_str

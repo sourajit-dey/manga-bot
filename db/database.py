@@ -24,6 +24,7 @@ class Database:
         self.manga = self.db.manga
         self.chapters = self.db.chapters
         self.state = self.db.state
+        self.priority_chapters = self.db.priority_chapters
         logger.info("Connected to MongoDB")
         await self.setup_indexes()
 
