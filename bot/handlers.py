@@ -235,7 +235,7 @@ async def text_search_handler(client: Client, message: Message):
         
         for res in results:
             title, score, index = res
-            if score > 75: # Threshold
+            if score >= 85: # Stricter Threshold
                 for m in mangas:
                     if m["title"] == title:
                         matched_mangas.append(m)
@@ -263,7 +263,7 @@ async def suggestion_reply_handler(client: Client, message: Message):
         
         search_msg = await message.reply_text("Checking online databases for your suggestion...")
         try:
-            results = await mangadex._request("GET", "/manga", params={"title": query, "limit": 5})
+            results = await mangadex._request("GET", "/manga", params={"title": query, "limit": 10, "order[relevance]": "desc"})
             if results and results.get("data"):
                 best_manga = None
                 best_overall_score = 0
@@ -284,8 +284,8 @@ async def suggestion_reply_handler(client: Client, message: Message):
                             best_overall_score = score
                             best_manga = m_data
                             
-                if best_overall_score < 70 or not best_manga:
-                    await search_msg.edit_text(f"Could not find a highly relevant manga for '{query}'. Please check the exact spelling.")
+                if best_overall_score < 85 or not best_manga:
+                    await search_msg.edit_text(f"Could not find an exact match for '{query}'. Please try using the Japanese Romaji name, or check your spelling.")
                     return
                 
                 manga_doc, is_new = await process_manga_metadata(best_manga)
@@ -402,7 +402,7 @@ async def callback_handler(client: Client, callback_query: CallbackQuery):
         if manga:
             # Click-to-prioritize
             await db.manga.update_one({"manga_id": manga_id}, {"$set": {"priority": 1}})
-            await callback_query.answer()
+            await callback_query.answer("Moved to Priority Queue! The background scraper will fetch this next.", show_alert=True)
             await send_manga_details(client, callback_query.message.chat.id, manga)
         else:
             await callback_query.answer("Manga not found.", show_alert=True)
