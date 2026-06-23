@@ -66,6 +66,7 @@ async def main():
         BotCommand("start", "Start the bot"),
         BotCommand("random", "Get a random manga"),
         BotCommand("latest", "View recently added manga"),
+        BotCommand("queue", "View the current priority queue"),
         BotCommand("stats", "View bot statistics (Admin)"),
         BotCommand("setwelcome", "Set the welcome message (Admin)"),
         BotCommand("setimage", "Set the welcome image (Admin)"),
