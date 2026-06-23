@@ -135,10 +135,13 @@ async def process_chapter(client, storage_channel_id, manga_doc, chapter_data):
             
             # Upload to Telegram
             logger.info(f"Uploading {file_name} to storage channel")
-            message = await client.send_document(
-                chat_id=storage_channel_id,
-                document=pdf_path,
-                caption=f"**{manga_doc['title']}**\nChapter: {chapter_number}\nTitle: {title}"
+            message = await asyncio.wait_for(
+                client.send_document(
+                    chat_id=storage_channel_id,
+                    document=pdf_path,
+                    caption=f"**{manga_doc['title']}**\nChapter: {chapter_number}\nTitle: {title}"
+                ),
+                timeout=300 # 5 minutes maximum timeout
             )
             
             logger.info(f"Successfully uploaded {file_name}")
